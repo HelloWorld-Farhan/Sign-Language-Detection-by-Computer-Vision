@@ -1,0 +1,486 @@
+package com.yourpackage.islvision;import android.Manifest;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.content.ContentValues;
+import android.net.Uri;
+import android.os.Environment;
+import android.os.Bundle;
+import android.speech.tts.UtteranceProgressListener;
+import android.provider.MediaStore;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.ImageView;
+import androidx.appcompat.app.AlertDialog;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import android.graphics.BitmapFactory;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.speech.tts.TextToSpeech;
+import android.util.Log;
+import android.widget.ImageButton;
+import android.widget.TextView;
+import android.widget.Toast;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.AspectRatio;
+import androidx.camera.core.Camera;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.google.common.util.concurrent.ListenableFuture;
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "ISL_Main";
+    private static final int CAMERA_PERMISSION_CODE = 100;
+    private static final float CONFIDENCE_THRESHOLD = 0.75f;
+    private static final int REQUIRED_FRAMES = 3;
+    private static final int COOLDOWN_MS = 1500;
+    private PreviewView previewView;
+    private TextView resultText, confidenceText, wordText, sentenceText;
+    private FloatingActionButton captureButton, backspaceButton, spaceButton, clearButton, referenceButton;
+    private ImageButton flashButton, speakWordButton, speakSentenceButton;
+    private SignLanguageClassifier classifier;
+    private ExecutorService cameraExecutor;
+    private Handler mainHandler;
+    private Camera camera;
+    private Vibrator vibrator;
+    private ToneGenerator toneGenerator;
+    private TextToSpeech textToSpeech;
+    private boolean isFlashOn = false;
+    private StringBuilder currentWord = new StringBuilder();
+    private StringBuilder currentSentence = new StringBuilder();
+    private boolean isCapturing = false;
+    private boolean canCapture = true;
+    private String lastPredictedLetter = "";
+    private int consecutiveCount = 0;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        initializeViews();
+        initializeHardware();
+
+        classifier = new SignLanguageClassifier(this);
+        cameraExecutor = Executors.newSingleThreadExecutor();
+        mainHandler = new Handler(Looper.getMainLooper());
+
+        if (checkPermissions()) {
+            startCamera();
+        } else {
+            requestPermissions();
+        }
+
+        initializeButtons();
+    }
+    // Add this method after initializeButtons()
+    private void showReferenceDialog() {
+        try {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            View dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_reference, null);
+            ImageView referenceImage = dialogView.findViewById(R.id.referenceImage);
+            referenceImage.setImageResource(R.drawable.isl_alphabet);
+
+            AlertDialog dialog = builder.setView(dialogView)
+                    .setTitle("ISL Reference")
+                    .setPositiveButton("Download", (dialogInterface, which) -> saveReferenceToGallery())
+                    .setNegativeButton("Close", null)
+                    .create();
+
+            dialog.show();
+        } catch (Exception e) {
+            Log.e(TAG, "Dialog error", e);
+        }
+    }
+
+    // Add this method to save the image
+    private void saveReferenceToGallery() {
+        try {
+            Bitmap bitmap = BitmapFactory.decodeResource(getResources(), R.drawable.isl_alphabet);
+            String fileName = "ISL_Reference_" + System.currentTimeMillis() + ".jpg";
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Android 10+
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ISL Vision");
+
+                Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    OutputStream os = getContentResolver().openOutputStream(uri);
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, os);
+                    os.close();
+                    Toast.makeText(this, "✅ Saved to Pictures/ISL Vision", Toast.LENGTH_LONG).show();
+                }
+            } else {
+                // Android 9 and below
+                File directory = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "ISL Vision");
+                if (!directory.exists()) directory.mkdirs();
+
+                File file = new File(directory, fileName);
+                FileOutputStream fos = new FileOutputStream(file);
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos);
+                fos.close();
+
+                Toast.makeText(this, "✅ Saved to Pictures/ISL Vision", Toast.LENGTH_LONG).show();
+            }
+
+            bitmap.recycle();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Save failed", e);
+            Toast.makeText(this, "❌ Save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+    private void initializeViews() {
+        previewView = findViewById(R.id.previewView);
+        resultText = findViewById(R.id.resultText);
+        confidenceText = findViewById(R.id.confidenceText);
+        wordText = findViewById(R.id.wordText);
+        sentenceText = findViewById(R.id.sentenceText);
+        captureButton = findViewById(R.id.captureButton);
+        backspaceButton = findViewById(R.id.backspaceButton);
+        spaceButton = findViewById(R.id.spaceButton);
+        clearButton = findViewById(R.id.clearButton);
+        referenceButton = findViewById(R.id.referenceButton);
+        flashButton = findViewById(R.id.flashButton);
+        speakWordButton = findViewById(R.id.speakWordButton);
+        speakSentenceButton = findViewById(R.id.speakSentenceButton);
+    }
+
+    private void initializeHardware() {
+        vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        try {
+            toneGenerator = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
+        } catch (Exception e) {
+            Log.e(TAG, "ToneGenerator failed", e);
+        }
+        textToSpeech = new TextToSpeech(this, status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                textToSpeech.setLanguage(Locale.US);
+            }
+        });
+    }
+
+    private void vibrate() {
+        if (vibrator != null && vibrator.hasVibrator()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE));
+            } else {
+                vibrator.vibrate(50);
+            }
+        }
+    }
+
+    private void playSound() {
+        if (toneGenerator != null) {
+            try {
+                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, 100);
+            } catch (Exception e) {
+                Log.e(TAG, "Sound failed", e);
+            }
+        }
+    }
+
+    private void initializeButtons() {
+        captureButton.setOnClickListener(v -> {
+            if (!isCapturing && canCapture) {
+                isCapturing = true;
+                lastPredictedLetter = "";
+                consecutiveCount = 0;
+                captureButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFFFF9800));
+                vibrate();
+                playSound();
+            }
+        });
+
+        backspaceButton.setOnClickListener(v -> {
+            vibrate();
+            if (currentWord.length() > 0) {
+                currentWord.deleteCharAt(currentWord.length() - 1);
+                wordText.setText(currentWord.toString());
+            }
+        });
+
+        spaceButton.setOnClickListener(v -> {
+            vibrate();
+            if (currentWord.length() > 0) {
+                if (currentSentence.length() > 0) currentSentence.append(" ");
+                currentSentence.append(currentWord.toString());
+                sentenceText.setText(currentSentence.toString());
+                currentWord = new StringBuilder();
+                wordText.setText("");
+            }
+        });
+
+        clearButton.setOnClickListener(v -> {
+            vibrate();
+            currentWord = new StringBuilder();
+            currentSentence = new StringBuilder();
+            wordText.setText("");
+            sentenceText.setText("");
+            resultText.setText("--");
+            confidenceText.setText("Cleared");
+        });
+
+        referenceButton.setOnClickListener(v -> {
+            vibrate();
+            showReferenceDialog();
+        });
+
+        flashButton.setOnClickListener(v -> {
+            if (camera != null) {
+                try {
+                    isFlashOn = !isFlashOn;
+                    camera.getCameraControl().enableTorch(isFlashOn);
+                    flashButton.setImageResource(isFlashOn ? R.drawable.flash : R.drawable.flash_off);
+                    vibrate();
+                } catch (Exception e) {
+                    Log.e(TAG, "Flash failed", e);
+                }
+            }
+        });
+
+        speakWordButton.setOnClickListener(v -> {
+            vibrate();
+            String word = currentWord.toString();
+            if (!word.isEmpty() && textToSpeech != null) {
+                speakWordButton.setImageResource(R.drawable.volume_on);
+
+                textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {}
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        runOnUiThread(() -> speakWordButton.setImageResource(R.drawable.volume_off));
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        runOnUiThread(() -> speakWordButton.setImageResource(R.drawable.volume_off));
+                    }
+                });
+
+                Bundle params = new Bundle();
+                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "word");
+                textToSpeech.speak(word, TextToSpeech.QUEUE_FLUSH, params, "word");
+            }
+        });
+
+        speakSentenceButton.setOnClickListener(v -> {
+            vibrate();
+            String sentence = currentSentence.toString();
+            if (!sentence.isEmpty() && textToSpeech != null) {
+                speakSentenceButton.setImageResource(R.drawable.volume_on);
+
+                textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {}
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        runOnUiThread(() -> speakSentenceButton.setImageResource(R.drawable.volume_off));
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        runOnUiThread(() -> speakSentenceButton.setImageResource(R.drawable.volume_off));
+                    }
+                });
+
+                Bundle params = new Bundle();
+                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "sentence");
+                textToSpeech.speak(sentence, TextToSpeech.QUEUE_FLUSH, params, "sentence");
+            }
+        });
+    }
+
+    private boolean checkPermissions() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestPermissions() {
+        ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION_CODE);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == CAMERA_PERMISSION_CODE && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startCamera();
+        } else {
+            finish();
+        }
+    }
+
+    private void startCamera() {
+        ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
+        future.addListener(() -> {
+            try {
+                ProcessCameraProvider provider = future.get();
+                bindCameraUseCases(provider);
+            } catch (Exception e) {
+                Log.e(TAG, "Camera error", e);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void bindCameraUseCases(ProcessCameraProvider provider) {
+        Preview preview = new Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).build();
+        preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .build();
+
+        imageAnalysis.setAnalyzer(cameraExecutor, imageProxy -> analyzeFrame(imageProxy));
+
+        CameraSelector selector = new CameraSelector.Builder().requireLensFacing(CameraSelector.LENS_FACING_BACK).build();
+
+        try {
+            provider.unbindAll();
+            camera = provider.bindToLifecycle(this, selector, preview, imageAnalysis);
+        } catch (Exception e) {
+            Log.e(TAG, "Bind failed", e);
+        }
+    }
+
+    private void analyzeFrame(ImageProxy imageProxy) {
+        if (!isCapturing) {
+            imageProxy.close();
+            return;
+        }
+        try {
+            Bitmap bitmap = convertImageProxyToBitmap(imageProxy);
+            if (bitmap != null) {
+                Bitmap cropped = cropToCenter(bitmap);
+                SignLanguageClassifier.Result result = classifier.classify(cropped);
+                runOnUiThread(() -> updateUIWithResult(result));
+                cropped.recycle();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Analysis error", e);
+        } finally {
+            imageProxy.close();
+        }
+    }
+
+    private Bitmap convertImageProxyToBitmap(ImageProxy image) {
+        try {
+            ImageProxy.PlaneProxy[] planes = image.getPlanes();
+            ByteBuffer yBuffer = planes[0].getBuffer();
+            ByteBuffer uBuffer = planes[1].getBuffer();
+            ByteBuffer vBuffer = planes[2].getBuffer();
+            int ySize = yBuffer.remaining();
+            int uSize = uBuffer.remaining();
+            int vSize = vBuffer.remaining();
+            byte[] nv21 = new byte[ySize + uSize + vSize];
+            yBuffer.get(nv21, 0, ySize);
+            vBuffer.get(nv21, ySize, vSize);
+            uBuffer.get(nv21, ySize + vSize, uSize);
+            YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, image.getWidth(), image.getHeight(), null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 100, out);
+            byte[] jpegBytes = out.toByteArray();
+            Bitmap bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+            Matrix matrix = new Matrix();
+            matrix.postRotate(90);
+            Bitmap rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+            if (rotated != bitmap) bitmap.recycle();
+            return rotated;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Bitmap cropToCenter(Bitmap src) {
+        int size = Math.min(src.getWidth(), src.getHeight());
+        int x = (src.getWidth() - size) / 2;
+        int y = (src.getHeight() - size) / 2;
+        Bitmap cropped = Bitmap.createBitmap(src, x, y, size, size);
+        if (cropped != src) src.recycle();
+        return cropped;
+    }
+
+    private void updateUIWithResult(SignLanguageClassifier.Result result) {
+        String label = result.getLabel();
+        float conf = result.getConfidence();
+        resultText.setText(label);
+        confidenceText.setText(String.format("%.0f%%", conf * 100));
+
+        if (conf >= CONFIDENCE_THRESHOLD) {
+            confidenceText.setTextColor(0xFF4CAF50);
+            if (label.equals(lastPredictedLetter)) {
+                consecutiveCount++;
+            } else {
+                lastPredictedLetter = label;
+                consecutiveCount = 1;
+            }
+            if (consecutiveCount >= REQUIRED_FRAMES) {
+                addLetterToCurrentWord(label);
+                resetCaptureState();
+            }
+        } else {
+            confidenceText.setTextColor(0xFFFF5722);
+        }
+    }
+
+    private void addLetterToCurrentWord(String letter) {
+        currentWord.append(letter);
+        wordText.setText(currentWord.toString());
+        captureButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFF4CAF50));
+        Toast.makeText(this, letter, Toast.LENGTH_SHORT).show();
+        vibrate();
+        playSound();
+        canCapture = false;
+        mainHandler.postDelayed(() -> {
+            canCapture = true;
+            captureButton.setBackgroundTintList(android.content.res.ColorStateList.valueOf(0xFF4CAF50));
+        }, COOLDOWN_MS);
+    }
+
+    private void resetCaptureState() {
+        isCapturing = false;
+        lastPredictedLetter = "";
+        consecutiveCount = 0;
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (classifier != null) classifier.close();
+        if (cameraExecutor != null) cameraExecutor.shutdown();
+        if (textToSpeech != null) {
+            textToSpeech.stop();
+            textToSpeech.shutdown();
+        }
+        if (toneGenerator != null) toneGenerator.release();
+    }
+}

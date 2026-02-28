@@ -1,0 +1,698 @@
+package com.yourpackage.islvision;
+
+import android.Manifest;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.ImageFormat;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.Typeface;
+import android.graphics.YuvImage;
+import android.media.AudioManager;
+import android.media.ToneGenerator;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.provider.MediaStore;
+import android.speech.tts.TextToSpeech;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.ImageButton;
+import android.widget.ImageView;
+import android.widget.TextView;
+import android.widget.Toast;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.AspectRatio;
+import androidx.camera.core.Camera;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.google.common.util.concurrent.ListenableFuture;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.Locale;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "ISL_MainActivity";
+    private static final int CAMERA_PERMISSION_CODE = 100;
+    private static final int STORAGE_PERMISSION_CODE = 101;
+    private static final float CONFIDENCE_THRESHOLD = 0.65f; // ✅ Increased for better accuracy
+    private static final int CONFIRMATION_FRAMES = 3;
+    private static final int COOLDOWN_MS = 1500;
+    private PreviewView previewView;
+    private TextView resultText;
+    private TextView confidenceText;
+    private TextView wordText;
+    private TextView sentenceText;
+    private FloatingActionButton captureButton;
+    private FloatingActionButton backspaceButton;
+    private FloatingActionButton spaceButton;
+    private FloatingActionButton clearButton;
+    private FloatingActionButton referenceButton;
+    private ImageButton flashButton; // ✅ NEW
+    private ImageButton speakWordButton; // ✅ NEW
+    private ImageButton speakSentenceButton; // ✅ NEW
+
+    private SignLanguageClassifier classifier;
+    private ExecutorService cameraExecutor;
+    private Handler mainHandler;
+    private Camera camera; // ✅ For flash control
+    private boolean isFlashOn = false;
+
+    // ✅ NEW: Sound, Vibrate, TTS
+    private Vibrator vibrator;
+    private ToneGenerator toneGenerator;
+    private TextToSpeech textToSpeech;
+
+    private StringBuilder currentWord = new StringBuilder();
+    private StringBuilder currentSentence = new StringBuilder();
+    private boolean isCapturing = false;
+    private boolean canCapture = true;
+
+    private String lastPredictedLetter = "";
+    private int consecutiveCount = 0;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        initViews();
+        initSoundAndVibrate(); // ✅ NEW
+        initTextToSpeech(); // ✅ NEW
+
+        classifier = new SignLanguageClassifier(this);
+        cameraExecutor = Executors.newSingleThreadExecutor();
+        mainHandler = new Handler(Looper.getMainLooper());
+
+        if (checkPermissions()) {
+            startCamera();
+        } else {
+            requestPermissions();
+        }
+
+        setupButtons();
+
+        Log.d(TAG, "🚀 ISL Vision started");
+    }
+
+    private void initViews() {
+        previewView = findViewById(R.id.previewView);
+        resultText = findViewById(R.id.resultText);
+        confidenceText = findViewById(R.id.confidenceText);
+        wordText = findViewById(R.id.wordText);
+        sentenceText = findViewById(R.id.sentenceText);
+        captureButton = findViewById(R.id.captureButton);
+        backspaceButton = findViewById(R.id.backspaceButton);
+        spaceButton = findViewById(R.id.spaceButton);
+        clearButton = findViewById(R.id.clearButton);
+        referenceButton = findViewById(R.id.referenceButton);
+        flashButton = findViewById(R.id.flashButton); // ✅ NEW
+        speakWordButton = findViewById(R.id.speakWordButton); // ✅ NEW
+        speakSentenceButton = findViewById(R.id.speakSentenceButton); // ✅ NEW
+
+        Log.d(TAG, "✅ All views initialized");
+    }
+
+    // ✅ NEW: Initialize Sound & Vibrate
+    private void initSoundAndVibrate() {
+        vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        try {
+            toneGenerator = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
+        } catch (Exception e) {
+            Log.e(TAG, "ToneGenerator failed", e);
+        }
+    }
+
+    // ✅ NEW: Initialize Text-to-Speech
+    private void initTextToSpeech() {
+        textToSpeech = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+            @Override
+            public void onInit(int status) {
+                if (status == TextToSpeech.SUCCESS) {
+                    textToSpeech.setLanguage(Locale.US);
+                    Log.d(TAG, "✅ TTS initialized");
+                }
+            }
+        });
+    }
+
+    // ✅ NEW: Haptic feedback
+    private void vibrate() {
+        if (vibrator != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE));
+            } else {
+                vibrator.vibrate(50);
+            }
+        }
+    }
+
+    // ✅ NEW: Click sound
+    private void playClickSound() {
+        if (toneGenerator != null) {
+            try {
+                toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, 100);
+            } catch (Exception e) {
+                Log.e(TAG, "Sound failed", e);
+            }
+        }
+    }
+
+    // ✅ NEW: Speak text
+    private void speak(String text) {
+        if (textToSpeech != null && !text.isEmpty()) {
+            textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, null);
+        }
+    }
+
+    // ✅ NEW: Toggle flash
+    private void toggleFlash() {
+        if (camera == null) {
+            Toast.makeText(this, "⚠️ Camera not ready", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        try {
+            isFlashOn = !isFlashOn;
+            camera.getCameraControl().enableTorch(isFlashOn);
+
+            if (isFlashOn) {
+                flashButton.setImageResource(R.drawable.flash);
+                Toast.makeText(this, "💡 Flash ON", Toast.LENGTH_SHORT).show();
+            } else {
+                flashButton.setImageResource(R.drawable.flash_off);
+                Toast.makeText(this, "🌙 Flash OFF", Toast.LENGTH_SHORT).show();
+            }
+
+            vibrate();
+            playClickSound();
+
+        } catch (Exception e) {
+            Log.e(TAG, "Flash error", e);
+            Toast.makeText(this, "❌ Flash not available", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void setupButtons() {
+        // Capture Button (with sound & vibrate)
+        captureButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (!isCapturing && canCapture) {
+                    isCapturing = true;
+                    captureButton.setBackgroundTintList(
+                            android.content.res.ColorStateList.valueOf(0xFFFF9800));
+                    Toast.makeText(MainActivity.this, "📸 Hold steady...", Toast.LENGTH_SHORT).show();
+                    vibrate(); // ✅ NEW
+                    playClickSound(); // ✅ NEW
+                }
+            }
+        });
+
+        // Backspace Button (with sound & vibrate)
+        backspaceButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate(); // ✅ NEW
+                playClickSound(); // ✅ NEW
+
+                if (currentWord.length() > 0) {
+                    char deleted = currentWord.charAt(currentWord.length() - 1);
+                    currentWord.deleteCharAt(currentWord.length() - 1);
+                    wordText.setText(currentWord.toString());
+                    Toast.makeText(MainActivity.this, "⌫ Deleted: " + deleted, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "⚠️ Word is empty", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        // Space Button (with sound & vibrate)
+        spaceButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate(); // ✅ NEW
+                playClickSound(); // ✅ NEW
+
+                if (currentWord.length() > 0) {
+                    String wordToAdd = currentWord.toString();
+
+                    if (currentSentence.length() > 0) {
+                        currentSentence.append(" ");
+                    }
+                    currentSentence.append(wordToAdd);
+
+                    sentenceText.setText(currentSentence.toString());
+                    currentWord = new StringBuilder();
+                    wordText.setText("");
+
+                    Toast.makeText(MainActivity.this, "✅ Added: " + wordToAdd, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "⚠️ No word to add", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        // Clear Button (with sound & vibrate)
+        clearButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate(); // ✅ NEW
+                playClickSound(); // ✅ NEW
+
+                currentWord = new StringBuilder();
+                currentSentence = new StringBuilder();
+                wordText.setText("");
+                sentenceText.setText("");
+                resultText.setText("--");
+                confidenceText.setText("Confidence: --%");
+                lastPredictedLetter = "";
+                consecutiveCount = 0;
+                Toast.makeText(MainActivity.this, "🗑️ Cleared all", Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        // Reference Button (with sound & vibrate)
+        referenceButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate(); // ✅ NEW
+                playClickSound(); // ✅ NEW
+                showReferenceDialog();
+            }
+        });
+
+        // ✅ NEW: Flash Button
+        flashButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleFlash();
+            }
+        });
+
+        // ✅ NEW: Speak Word Button
+        speakWordButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate();
+                playClickSound();
+
+                String word = currentWord.toString();
+                if (!word.isEmpty()) {
+                    speak(word);
+                    // Change icon to volume_on
+                    speakWordButton.setImageResource(R.drawable.volume_on);
+                    // Reset icon after 1 second
+                    new Handler().postDelayed(() -> {
+                        speakWordButton.setImageResource(R.drawable.volume_off);
+                    }, 1000);
+                    Toast.makeText(MainActivity.this, "🔊 Speaking: " + word, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "⚠️ No word to speak", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        // ✅ NEW: Speak Sentence Button
+        speakSentenceButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                vibrate();
+                playClickSound();
+
+                String sentence = currentSentence.toString();
+                if (!sentence.isEmpty()) {
+                    speak(sentence);
+                    // Change icon to volume_on
+                    speakSentenceButton.setImageResource(R.drawable.volume_on);
+                    // Reset icon after 1 second
+                    new Handler().postDelayed(() -> {
+                        speakSentenceButton.setImageResource(R.drawable.volume_off);
+                    }, 1000);
+                    Toast.makeText(MainActivity.this, "🔊 Speaking sentence...", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(MainActivity.this, "⚠️ No sentence to speak", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+
+        Log.d(TAG, "✅ All buttons configured");
+    }
+
+    private void showReferenceDialog() {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        View dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_reference, null);
+
+        ImageView referenceImage = dialogView.findViewById(R.id.referenceImage);
+        referenceImage.setImageResource(R.drawable.isl_alphabet);
+
+        AlertDialog dialog = builder.setView(dialogView)
+                .setTitle("📖 ISL Alphabet Reference")
+                .setPositiveButton("💾 Save to Gallery", (dialogInterface, which) -> {
+                    saveReferenceToGallery();
+                })
+                .setNegativeButton("Close", null)
+                .create();
+
+        dialog.show();
+
+        dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK));
+
+        android.widget.Button positiveButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        android.widget.Button negativeButton = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+
+        if (positiveButton != null) {
+            positiveButton.setTextColor(android.graphics.Color.RED);
+        }
+        if (negativeButton != null) {
+            negativeButton.setTextColor(android.graphics.Color.RED);
+        }
+    }
+
+    private void saveReferenceToGallery() {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                        STORAGE_PERMISSION_CODE);
+                return;
+            }
+        }
+
+        try {
+            Bitmap originalBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.isl_alphabet);
+            Bitmap enhancedBitmap = addWatermark(originalBitmap, "ISL Vision App");
+            String fileName = "ISL_Alphabet_Reference_" + System.currentTimeMillis() + ".jpg";
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+                values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ISL Vision");
+
+                Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                if (uri != null) {
+                    OutputStream outputStream = getContentResolver().openOutputStream(uri);
+                    enhancedBitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream);
+                    outputStream.close();
+
+                    Toast.makeText(this, "✅ Saved to Gallery!", Toast.LENGTH_LONG).show();
+                    showSuccessDialog();
+                }
+            } else {
+                File directory = new File(Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES), "ISL Vision");
+                if (!directory.exists()) {
+                    directory.mkdirs();
+                }
+
+                File file = new File(directory, fileName);
+                FileOutputStream fos = new FileOutputStream(file);
+                enhancedBitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos);
+                fos.close();
+
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.DATA, file.getAbsolutePath());
+                getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+
+                Toast.makeText(this, "✅ Saved to Pictures/ISL Vision/", Toast.LENGTH_LONG).show();
+                showSuccessDialog();
+            }
+
+            Log.d(TAG, "✅ Reference guide saved successfully");
+
+        } catch (Exception e) {
+            Log.e(TAG, "❌ Error saving reference", e);
+            Toast.makeText(this, "❌ Error saving image: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private Bitmap addWatermark(Bitmap src, String watermark) {
+        int width = src.getWidth();
+        int height = src.getHeight();
+
+        Bitmap result = Bitmap.createBitmap(width, height, src.getConfig());
+        Canvas canvas = new Canvas(result);
+        canvas.drawBitmap(src, 0, 0, null);
+
+        Paint paint = new Paint();
+        paint.setColor(Color.WHITE);
+        paint.setTextSize(40);
+        paint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        paint.setShadowLayer(2, 2, 2, Color.BLACK);
+        paint.setAntiAlias(true);
+
+        float x = 20;
+        float y = height - 30;
+        canvas.drawText(watermark, x, y, paint);
+
+        return result;
+    }
+
+    private void showSuccessDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("✅ Saved Successfully!")
+                .setMessage("ISL Alphabet Reference has been saved to your gallery.\n\n📂 Location: Pictures/ISL Vision/")
+                .setPositiveButton("OK", null)
+                .setIcon(android.R.drawable.ic_menu_gallery)
+                .show();
+    }
+
+    private boolean checkPermissions() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestPermissions() {
+        ActivityCompat.requestPermissions(this,
+                new String[]{Manifest.permission.CAMERA},
+                CAMERA_PERMISSION_CODE);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == CAMERA_PERMISSION_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startCamera();
+            } else {
+                Toast.makeText(this, "❌ Camera permission required", Toast.LENGTH_LONG).show();
+                finish();
+            }
+        } else if (requestCode == STORAGE_PERMISSION_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                saveReferenceToGallery();
+            } else {
+                Toast.makeText(this, "⚠️ Storage permission needed to save image", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    private void startCamera() {
+        ListenableFuture<ProcessCameraProvider> cameraProviderFuture =
+                ProcessCameraProvider.getInstance(this);
+
+        cameraProviderFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+                bindCameraUseCases(cameraProvider);
+            } catch (ExecutionException | InterruptedException e) {
+                Log.e(TAG, "❌ Error starting camera", e);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void bindCameraUseCases(ProcessCameraProvider cameraProvider) {
+        Preview preview = new Preview.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .build();
+
+        preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .build();
+
+        imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
+
+        CameraSelector cameraSelector = new CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                .build();
+
+        try {
+            cameraProvider.unbindAll();
+            camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis); // ✅ Store camera
+            Log.d(TAG, "✅ Camera initialized");
+        } catch (Exception e) {
+            Log.e(TAG, "❌ Camera binding failed", e);
+        }
+    }
+
+    private void analyzeImage(ImageProxy imageProxy) {
+        if (!isCapturing) {
+            imageProxy.close();
+            return;
+        }
+
+        try {
+            Bitmap bitmap = imageProxyToBitmap(imageProxy);
+            if (bitmap != null) {
+                Bitmap croppedBitmap = cropToCenter(bitmap);
+                SignLanguageClassifier.Result result = classifier.classify(croppedBitmap);
+                runOnUiThread(() -> processResult(result));
+                croppedBitmap.recycle();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "❌ Error analyzing image", e);
+        } finally {
+            imageProxy.close();
+        }
+    }
+
+    private Bitmap cropToCenter(Bitmap source) {
+        int size = Math.min(source.getWidth(), source.getHeight());
+        int x = (source.getWidth() - size) / 2;
+        int y = (source.getHeight() - size) / 2;
+
+        Bitmap cropped = Bitmap.createBitmap(source, x, y, size, size);
+        if (cropped != source) {
+            source.recycle();
+        }
+        return cropped;
+    }
+
+    private Bitmap imageProxyToBitmap(ImageProxy image) {
+        ImageProxy.PlaneProxy[] planes = image.getPlanes();
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
+
+        int ySize = yBuffer.remaining();
+        int uSize = uBuffer.remaining();
+        int vSize = vBuffer.remaining();
+
+        byte[] nv21 = new byte[ySize + uSize + vSize];
+        yBuffer.get(nv21, 0, ySize);
+        vBuffer.get(nv21, ySize, vSize);
+        uBuffer.get(nv21, ySize + vSize, uSize);
+
+        YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21,
+                image.getWidth(), image.getHeight(), null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        yuvImage.compressToJpeg(new Rect(0, 0, image.getWidth(), image.getHeight()), 100, out);
+        byte[] imageBytes = out.toByteArray();
+
+        Bitmap bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
+
+        Matrix matrix = new Matrix();
+        matrix.postRotate(90);
+        Bitmap rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0,
+                bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+        if (rotatedBitmap != bitmap) {
+            bitmap.recycle();
+        }
+
+        return rotatedBitmap;
+    }
+
+    private void processResult(SignLanguageClassifier.Result result) {
+        resultText.setText(result.getLabel());
+        confidenceText.setText("Confidence: " + result.getConfidencePercent() + "%");
+
+        if (result.getConfidence() >= CONFIDENCE_THRESHOLD) {
+            confidenceText.setTextColor(0xFF4CAF50);
+
+            if (result.getLabel().equals(lastPredictedLetter)) {
+                consecutiveCount++;
+            } else {
+                lastPredictedLetter = result.getLabel();
+                consecutiveCount = 1;
+            }
+
+            if (consecutiveCount >= CONFIRMATION_FRAMES) {
+                addLetterToWord(result.getLabel());
+                resetCapture();
+            }
+        } else {
+            confidenceText.setTextColor(0xFFFF5722);
+        }
+    }
+
+    private void addLetterToWord(String letter) {
+        currentWord.append(letter);
+        wordText.setText(currentWord.toString());
+
+        captureButton.setBackgroundTintList(
+                android.content.res.ColorStateList.valueOf(0xFF4CAF50));
+
+        Toast.makeText(this, "✅ Added: " + letter, Toast.LENGTH_SHORT).show();
+
+        // ✅ NEW: Success feedback
+        vibrate();
+        playClickSound();
+
+        canCapture = false;
+        mainHandler.postDelayed(() -> {
+            canCapture = true;
+            captureButton.setBackgroundTintList(
+                    android.content.res.ColorStateList.valueOf(0xFF4CAF50));
+        }, COOLDOWN_MS);
+    }
+
+    private void resetCapture() {
+        isCapturing = false;
+        lastPredictedLetter = "";
+        consecutiveCount = 0;
+        confidenceText.setTextColor(0xFF666666);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (classifier != null) {
+            classifier.close();
+        }
+        if (cameraExecutor != null) {
+            cameraExecutor.shutdown();
+        }
+        // ✅ NEW: Cleanup
+        if (textToSpeech != null) {
+            textToSpeech.stop();
+            textToSpeech.shutdown();
+        }
+        if (toneGenerator != null) {
+            toneGenerator.release();
+        }
+        Log.d(TAG, "🛑 ISL Vision stopped");
+    }
+}

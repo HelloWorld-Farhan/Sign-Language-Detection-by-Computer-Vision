@@ -1,0 +1,130 @@
+package com.yourpackage.islvision;
+
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.AnimatorSet;
+import android.animation.ObjectAnimator;
+import android.content.Intent;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.view.animation.AccelerateDecelerateInterpolator;
+import android.view.animation.AnticipateOvershootInterpolator;
+import android.widget.ImageView;
+import android.widget.ProgressBar;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
+
+public class SplashActivity extends AppCompatActivity {
+
+    private static final long ANIMATION_DURATION = 4000; // 4 seconds total
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_splash);
+
+        // Initialize views
+        ImageView islLogo = findViewById(R.id.islLogo);
+        TextView visionText = findViewById(R.id.visionText);
+        View redGlow = findViewById(R.id.redGlow);
+        ProgressBar progressBar = findViewById(R.id.progressBar);
+
+        // Start cinematic animation sequence
+        startCinematicAnimation(islLogo, visionText, redGlow, progressBar);
+
+        // Navigate to MainActivity after animation
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            Intent intent = new Intent(SplashActivity.this, MainActivity.class);
+            startActivity(intent);
+            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
+            finish();
+        }, ANIMATION_DURATION);
+    }
+
+    private void startCinematicAnimation(ImageView logo, TextView vision,
+                                         View glow, ProgressBar loader) {
+
+        // PHASE 1: Red glow expands from center (0-800ms)
+        ObjectAnimator glowScaleX = ObjectAnimator.ofFloat(glow, "scaleX", 0f, 1.2f);
+        ObjectAnimator glowScaleY = ObjectAnimator.ofFloat(glow, "scaleY", 0f, 1.2f);
+        ObjectAnimator glowAlpha = ObjectAnimator.ofFloat(glow, "alpha", 0f, 0.8f, 0.4f);
+
+        AnimatorSet glowAnim = new AnimatorSet();
+        glowAnim.playTogether(glowScaleX, glowScaleY, glowAlpha);
+        glowAnim.setDuration(1000);
+        glowAnim.setInterpolator(new AccelerateDecelerateInterpolator());
+
+        // PHASE 2: ISL Logo dramatic zoom (300-1500ms)
+        // Scale from tiny to huge with bounce effect
+        ObjectAnimator logoScaleX = ObjectAnimator.ofFloat(logo, "scaleX", 0.1f, 1.3f, 1.0f);
+        ObjectAnimator logoScaleY = ObjectAnimator.ofFloat(logo, "scaleY", 0.1f, 1.3f, 1.0f);
+        ObjectAnimator logoAlpha = ObjectAnimator.ofFloat(logo, "alpha", 0f, 1f);
+
+        // Add rotation for dynamic effect
+        ObjectAnimator logoRotate = ObjectAnimator.ofFloat(logo, "rotationY", 90f, 0f);
+
+        AnimatorSet logoAnim = new AnimatorSet();
+        logoAnim.playTogether(logoScaleX, logoScaleY, logoAlpha, logoRotate);
+        logoAnim.setDuration(1200);
+        logoAnim.setInterpolator(new AnticipateOvershootInterpolator(1.8f));
+        logoAnim.setStartDelay(300);
+
+        // PHASE 3: VISION text fades in from below (1200-2000ms)
+        ObjectAnimator visionAlpha = ObjectAnimator.ofFloat(vision, "alpha", 0f, 1f);
+        ObjectAnimator visionY = ObjectAnimator.ofFloat(vision, "translationY", 50f, 0f);
+
+        AnimatorSet visionAnim = new AnimatorSet();
+        visionAnim.playTogether(visionAlpha, visionY);
+        visionAnim.setDuration(800);
+        visionAnim.setInterpolator(new AccelerateDecelerateInterpolator());
+        visionAnim.setStartDelay(1200);
+
+        // PHASE 4: Progress bar appears (1800ms)
+        ObjectAnimator loaderAlpha = ObjectAnimator.ofFloat(loader, "alpha", 0f, 1f);
+        loaderAlpha.setDuration(500);
+        loaderAlpha.setStartDelay(1800);
+
+        // COMBINE ALL PHASES
+        AnimatorSet introSequence = new AnimatorSet();
+        introSequence.playTogether(glowAnim, logoAnim, visionAnim, loaderAlpha);
+
+        // Add subtle breathing animation after intro
+        introSequence.addListener(new AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(Animator animation) {
+                startBreathingAnimation(logo, vision);
+            }
+        });
+
+        introSequence.start();
+    }
+
+    private void startBreathingAnimation(ImageView logo, TextView vision) {
+        // Subtle pulse effect on logo
+        ObjectAnimator pulseX = ObjectAnimator.ofFloat(logo, "scaleX", 1.0f, 1.05f, 1.0f);
+        ObjectAnimator pulseY = ObjectAnimator.ofFloat(logo, "scaleY", 1.0f, 1.05f, 1.0f);
+        ObjectAnimator pulseAlpha = ObjectAnimator.ofFloat(vision, "alpha", 1.0f, 0.7f, 1.0f);
+
+        pulseX.setRepeatCount(ObjectAnimator.INFINITE);
+        pulseX.setRepeatMode(ObjectAnimator.REVERSE);
+        pulseY.setRepeatCount(ObjectAnimator.INFINITE);
+        pulseY.setRepeatMode(ObjectAnimator.REVERSE);
+        pulseAlpha.setRepeatCount(ObjectAnimator.INFINITE);
+        pulseAlpha.setRepeatMode(ObjectAnimator.REVERSE);
+
+        pulseX.setDuration(2000);
+        pulseY.setDuration(2000);
+        pulseAlpha.setDuration(2000);
+
+        pulseX.start();
+        pulseY.start();
+        pulseAlpha.start();
+    }
+
+    @Override
+    public void onBackPressed() {
+        // Disable back button during splash
+    }
+}

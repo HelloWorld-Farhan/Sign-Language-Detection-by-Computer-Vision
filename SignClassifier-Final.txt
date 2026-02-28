@@ -1,0 +1,325 @@
+package com.yourpackage.islvision;
+
+import android.content.Context;
+import android.content.res.AssetFileDescriptor;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.util.Log;
+
+import com.google.mediapipe.framework.image.BitmapImageBuilder;
+import com.google.mediapipe.framework.image.MPImage;
+import com.google.mediapipe.tasks.core.BaseOptions;
+import com.google.mediapipe.tasks.vision.core.RunningMode;
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
+
+import org.tensorflow.lite.Interpreter;
+
+import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.List;
+
+public class SignLanguageClassifier {
+
+    private static final String TAG = "ISL_Classifier";
+
+    private static final String MODEL_NAME = "isl_no_background.tflite";
+    private static final String HAND_MODEL = "hand_landmarker.task";
+    private static final String LABELS_FILE = "labels.txt";
+
+    private static final int IMG_SIZE = 224;
+    private static final int NUM_CLASSES = 26;
+
+    private Interpreter tflite;
+    private List<String> labels;
+    private HandLandmarker handLandmarker;
+
+    // ===================== Constructor =====================
+
+    public SignLanguageClassifier(Context context) {
+        try {
+            Interpreter.Options options = new Interpreter.Options();
+            options.setNumThreads(4);
+
+            tflite = new Interpreter(
+                    loadModelFile(context, MODEL_NAME),
+                    options
+            );
+
+            labels = loadLabels(context);
+
+            BaseOptions baseOptions = BaseOptions.builder()
+                    .setModelAssetPath(HAND_MODEL)
+                    .build();
+
+            HandLandmarker.HandLandmarkerOptions handOptions =
+                    HandLandmarker.HandLandmarkerOptions.builder()
+                            .setBaseOptions(baseOptions)
+                            .setRunningMode(RunningMode.IMAGE)
+                            .setNumHands(1)
+                            .setMinHandDetectionConfidence(0.3f)
+                            .build();
+
+            handLandmarker =
+                    HandLandmarker.createFromOptions(context, handOptions);
+
+            Log.d(TAG, "✅ Classifier initialized");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Initialization failed", e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    // ===================== Model Loading =====================
+
+    private MappedByteBuffer loadModelFile(
+            Context context,
+            String modelName
+    ) throws IOException {
+
+        AssetFileDescriptor fileDescriptor =
+                context.getAssets().openFd(modelName);
+
+        FileInputStream inputStream =
+                new FileInputStream(fileDescriptor.getFileDescriptor());
+
+        FileChannel fileChannel = inputStream.getChannel();
+
+        long startOffset = fileDescriptor.getStartOffset();
+        long declaredLength = fileDescriptor.getDeclaredLength();
+
+        return fileChannel.map(
+                FileChannel.MapMode.READ_ONLY,
+                startOffset,
+                declaredLength
+        );
+    }
+
+    private List<String> loadLabels(Context context)
+            throws IOException {
+
+        List<String> labelList = new ArrayList<>();
+
+        BufferedReader reader = new BufferedReader(
+                new InputStreamReader(
+                        context.getAssets().open(LABELS_FILE)
+                )
+        );
+
+        String line;
+        while ((line = reader.readLine()) != null) {
+            labelList.add(line.trim());
+        }
+
+        reader.close();
+        return labelList;
+    }
+
+    // ===================== Background Removal =====================
+
+    private Bitmap removeBackground(Bitmap bitmap) {
+
+        try {
+            MPImage mpImage =
+                    new BitmapImageBuilder(bitmap).build();
+
+            HandLandmarkerResult handResult =
+                    handLandmarker.detect(mpImage);
+
+            if (handResult.landmarks().isEmpty()) {
+                return createWhiteBackground(
+                        bitmap.getWidth(),
+                        bitmap.getHeight()
+                );
+            }
+
+            List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>
+                    landmarks = handResult.landmarks().get(0);
+
+            int width = bitmap.getWidth();
+            int height = bitmap.getHeight();
+
+            float minX = 1f, maxX = 0f;
+            float minY = 1f, maxY = 0f;
+
+            for (com.google.mediapipe.tasks.components.containers.NormalizedLandmark landmark : landmarks) {
+                minX = Math.min(minX, landmark.x());
+                maxX = Math.max(maxX, landmark.x());
+                minY = Math.min(minY, landmark.y());
+                maxY = Math.max(maxY, landmark.y());
+            }
+
+            float padding = 0.15f;
+
+            minX = Math.max(0, minX - padding);
+            maxX = Math.min(1, maxX + padding);
+            minY = Math.max(0, minY - padding);
+            maxY = Math.min(1, maxY + padding);
+
+            int x1 = (int) (minX * width);
+            int y1 = (int) (minY * height);
+            int x2 = (int) (maxX * width);
+            int y2 = (int) (maxY * height);
+
+            Bitmap output = Bitmap.createBitmap(
+                    width,
+                    height,
+                    Bitmap.Config.ARGB_8888
+            );
+
+            Canvas canvas = new Canvas(output);
+            canvas.drawColor(Color.WHITE);
+
+            Paint paint = new Paint();
+
+            canvas.drawBitmap(
+                    bitmap,
+                    new Rect(x1, y1, x2, y2),
+                    new Rect(x1, y1, x2, y2),
+                    paint
+            );
+
+            return output;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Background removal failed", e);
+            return bitmap;
+        }
+    }
+
+    private Bitmap createWhiteBackground(int width, int height) {
+        Bitmap bitmap = Bitmap.createBitmap(
+                width,
+                height,
+                Bitmap.Config.ARGB_8888
+        );
+
+        Canvas canvas = new Canvas(bitmap);
+        canvas.drawColor(Color.WHITE);
+
+        return bitmap;
+    }
+
+    // ===================== Classification =====================
+
+    public Result classify(Bitmap bitmap) {
+
+        if (tflite == null || bitmap == null) {
+            return new Result("Error", 0.0f);
+        }
+
+        try {
+            Bitmap noBg = removeBackground(bitmap);
+
+            Bitmap resized = Bitmap.createScaledBitmap(
+                    noBg,
+                    IMG_SIZE,
+                    IMG_SIZE,
+                    true
+            );
+
+            ByteBuffer inputBuffer = ByteBuffer.allocateDirect(
+                    4 * IMG_SIZE * IMG_SIZE * 3
+            );
+            inputBuffer.order(ByteOrder.nativeOrder());
+
+            int[] pixels = new int[IMG_SIZE * IMG_SIZE];
+            resized.getPixels(
+                    pixels,
+                    0,
+                    IMG_SIZE,
+                    0,
+                    0,
+                    IMG_SIZE,
+                    IMG_SIZE
+            );
+
+            for (int pixel : pixels) {
+                int r = (pixel >> 16) & 0xFF;
+                int g = (pixel >> 8) & 0xFF;
+                int b = pixel & 0xFF;
+
+                inputBuffer.putFloat(r / 255.0f);
+                inputBuffer.putFloat(g / 255.0f);
+                inputBuffer.putFloat(b / 255.0f);
+            }
+
+            float[][] output = new float[1][NUM_CLASSES];
+
+            tflite.run(inputBuffer, output);
+
+            float[] probabilities = output[0];
+
+            int maxIdx = 0;
+            float maxProb = probabilities[0];
+
+            for (int i = 1; i < NUM_CLASSES; i++) {
+                if (probabilities[i] > maxProb) {
+                    maxProb = probabilities[i];
+                    maxIdx = i;
+                }
+            }
+
+            String label = labels.get(maxIdx);
+
+            if (noBg != bitmap) noBg.recycle();
+            if (resized != noBg) resized.recycle();
+
+            return new Result(label, maxProb);
+
+        } catch (Exception e) {
+            Log.e(TAG, "Classification error", e);
+            return new Result("Error", 0.0f);
+        }
+    }
+
+    // ===================== Cleanup =====================
+
+    public void close() {
+        if (tflite != null) {
+            tflite.close();
+            tflite = null;
+        }
+
+        if (handLandmarker != null) {
+            handLandmarker.close();
+            handLandmarker = null;
+        }
+    }
+
+    // ===================== Result Class =====================
+
+    public static class Result {
+
+        private final String label;
+        private final float confidence;
+
+        public Result(String label, float confidence) {
+            this.label = label;
+            this.confidence = confidence;
+        }
+
+        public String getLabel() {
+            return label;
+        }
+
+        public float getConfidence() {
+            return confidence;
+        }
+
+        public int getConfidencePercent() {
+            return Math.round(confidence * 100);
+        }
+    }
+}
